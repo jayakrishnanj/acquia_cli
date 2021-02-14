@@ -3,56 +3,61 @@
 namespace AcquiaCli\Commands;
 
 use AcquiaCloudApi\Response\EnvironmentResponse;
+use AcquiaCloudApi\Endpoints\Environments;
 
 /**
  * Class ProductionModeCommand
+ *
  * @package AcquiaCli\Commands
  */
-class ProductionModeCommand extends AcquiaCommand
+class ProductionModeCommand extends EnvironmentsCommand
 {
 
     /**
      * Enable production mode for an environment.
      *
-     * @param string              $uuid
-     * @param EnvironmentResponse $environment
+     * @param  string              $uuid
+     * @param  EnvironmentResponse $environment
      * @throws \Exception
      *
      * @command productionmode:enable
-     * @alias pm:enable
+     * @aliases pm:enable
      */
-    public function acquiaProductionModeEnable($uuid, EnvironmentResponse $environment)
+    public function productionModeEnable(Environments $environmentsAdapter, $uuid, $environment)
     {
-        if ('prod' !== $environment->name) {
+
+        if ('prod' !== $environment) {
             throw new \Exception('Production mode may only be enabled/disabled on the prod environment.');
         }
-        $label = $environment->label;
-        $this->say("Enabling production mode for ${label} environment");
-        $this->cloudapi->enableProductionMode($environment->uuid);
-        $this->waitForTask($uuid, 'ProductionModeEnabled');
+
+        $environment = $this->cloudapiService->getEnvironment($uuid, $environment);
+
+        $this->say(sprintf('Enabling production mode for %s environment', $environment->label));
+        $environmentsAdapter->enableProductionMode($environment->uuid);
     }
 
     /**
      * Disable production mode for an environment.
      *
-     * @param string              $uuid
-     * @param EnvironmentResponse $environment
+     * @param  string              $uuid
+     * @param  EnvironmentResponse $environment
      * @throws \Exception
      *
      * @command productionmode:disable
-     * @alias pm:disable
+     * @aliases pm:disable
      */
-    public function acquiaRemoveDomain($uuid, EnvironmentResponse $environment)
+    public function productionModeDisable(Environments $environmentsAdapter, $uuid, $environment)
     {
-        if ('prod' !== $environment->name) {
+
+        if ('prod' !== $environment) {
             throw new \Exception('Production mode may only be enabled/disabled on the prod environment.');
         }
 
+        $environment = $this->cloudapiService->getEnvironment($uuid, $environment);
+
         if ($this->confirm('Are you sure you want to disable production mode?')) {
-            $label = $environment->label;
-            $this->say("Disabling production mode for ${label} environment");
-            $this->cloudapi->disableProductionMode($environment->uuid);
-            $this->waitForTask($uuid, 'ProductionModeDisabled');
+            $this->say(sprintf('Disabling production mode for %s environment', $environment->label));
+            $environmentsAdapter->disableProductionMode($environment->uuid);
         }
     }
 }

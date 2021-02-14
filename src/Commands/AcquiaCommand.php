@@ -2,62 +2,75 @@
 
 namespace AcquiaCli\Commands;
 
-use AcquiaCloudApi\CloudApi\Client;
-use AcquiaCloudApi\CloudApi\Connector;
+use AcquiaCloudApi\Endpoints\Environments;
+use AcquiaCloudApi\Endpoints\Notifications;
+use AcquiaCloudApi\Endpoints\Databases;
+use AcquiaCloudApi\Endpoints\DatabaseBackups;
 use AcquiaCloudApi\Response\DatabaseResponse;
 use AcquiaCloudApi\Response\EnvironmentResponse;
+use AcquiaCloudApi\Response\OperationResponse;
 use Consolidation\AnnotatedCommand\CommandData;
+use Symfony\Component\Console\Helper\ProgressBar;
+use Symfony\Component\Console\Helper\Table;
+use Symfony\Component\Console\Helper\TableStyle;
+use Consolidation\AnnotatedCommand\AnnotationData;
+use Symfony\Component\Console\Input\InputInterface;
 use Robo\Tasks;
 use Robo\Robo;
 use Exception;
-use Symfony\Component\Console\Helper\ProgressBar;
 
 /**
  * Class AcquiaCommand
+ *
  * @package AcquiaCli\Commands
  */
 abstract class AcquiaCommand extends Tasks
 {
-    use \Boedah\Robo\Task\Drush\loadTasks;
 
-    /** @var \AcquiaCloudApi\CloudApi\Client $cloudapi */
+    /**
+     * @var \AcquiaCli\Cli\CloudApi $cloudapiService
+     */
+    protected $cloudapiService;
+
+    /**
+     * @var \AcquiaCloudApi\Connector\Client $cloudapi
+     */
     protected $cloudapi;
 
-    /** Additional configuration. */
-    protected $extraConfig;
+    /**
+     * Regex for a valid UUID string.
+     */
+    public const UUIDV4 = '/^[0-9A-F]{8}-[0-9A-F]{4}-4[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i';
 
-    /** Regex for a valid UUID string. */
-    const UUIDV4 = '/^[0-9A-F]{8}-[0-9A-F]{4}-4[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i';
+    /**
+     * Task response from API indicates failure.
+     */
+    protected const TASKFAILED = 'failed';
 
-    /** Task response from API indicates failure. */
-    const TASKFAILED = 'failed';
+    /**
+     * Task response from API indicates completion.
+     */
+    protected const TASKCOMPLETED = 'completed';
 
-    /** Task response from API indicates completion. */
-    const TASKCOMPLETED = 'completed';
+    /**
+     * Task response from API indicates started.
+     */
+    protected const TASKSTARTED = 'started';
 
-    /** Task response from API indicates started. */
-    const TASKSTARTED = 'started';
-
-    /** Task response from API indicates in progress. */
-    const TASKINPROGRESS = 'in-progress';
+    /**
+     * Task response from API indicates in progress.
+     */
+    protected const TASKINPROGRESS = 'in-progress';
 
     /**
      * AcquiaCommand constructor.
      */
     public function __construct()
     {
-        $extraConfig = Robo::config()->get('extraconfig');
-        $this->extraConfig = $extraConfig;
+        $this->cloudapi = Robo::service('client');
+        $this->cloudapiService = Robo::service('cloudApi');
 
-        $acquia = Robo::config()->get('acquia');
-        $connector = new Connector([
-            'key' => $acquia['key'],
-            'secret' => $acquia['secret'],
-        ]);
-        $cloudapi = Client::factory($connector);
-
-        /** @var \AcquiaCloudApi\CloudApi\Client $cloudapi */
-        $this->cloudapi = $cloudapi;
+        $this->setTableStyles();
     }
 
     /**
@@ -65,170 +78,122 @@ abstract class AcquiaCommand extends Tasks
      * confirmation.
      *
      * @param string $question
+     * @param bool   $default
      */
-    protected function confirm($question)
+    protected function confirm($question, $default = false)
     {
         if ($this->input()->getOption('yes')) {
-            $this->say('Ignoring confirmation question as --yes option passed.');
+            if ($this->output->isVerbose()) {
+                $this->say('Ignoring confirmation question as --yes option passed.');
+            }
 
             return true;
         }
 
-        return parent::confirm($question);
+        return parent::confirm($question, $default);
+    }
+
+    /**
+     * Adds sort, limit, and filter options to the CloudAPI request.
+     *
+     * @hook validate
+     *
+     * @param CommandData $commandData
+     */
+    public function validateApiOptionsHook(CommandData $commandData)
+    {
+        if ($limit = $commandData->input()->getOption('limit')) {
+            $this->cloudapi->addQuery('limit', $limit);
+        }
+        if ($sort = $commandData->input()->getOption('sort')) {
+            $this->cloudapi->addQuery('sort', $sort);
+        }
+        if ($filter = $commandData->input()->getOption('filter')) {
+            $this->cloudapi->addQuery('filter', $filter);
+        }
     }
 
     /**
      * Replace application names and environment names with UUIDs before
      * commands run.
      *
-     * @hook validate
+     * @hook init
      *
-     * @param CommandData $commandData
+     * @param InputInterface $input
+     * @param AnnotationData $annotationData
      */
-    public function validateUuidHook(CommandData $commandData)
+    public function initUuidHook(InputInterface $input, AnnotationData $annotationData)
     {
-        if ($commandData->input()->hasArgument('uuid')) {
-            $uuid = $commandData->input()->getArgument('uuid');
+        if ($input->hasArgument('uuid')) {
+            $uuid = $input->getArgument('uuid');
 
             // Detect if a UUID has been passed in or a sitename.
-            if (!preg_match(self::UUIDV4, $uuid)) {
+            if (is_string($uuid) && !preg_match(self::UUIDV4, $uuid)) {
                 // Detect if this is not a fully qualified Acquia sitename e.g. prod:acquia
                 if (strpos($uuid, ':') === false) {
                     // Use a realm passed in from the command line e.g. --realm=devcloud.
                     // If no realm is specified, 'prod:' will be prepended by default.
-                    if ($commandData->input()->hasOption('realm')) {
-                        $uuid = $commandData->input()->getOption('realm') . ':' . $uuid;
+                    if ($input->hasOption('realm') && is_string($input->getOption('realm'))) {
+                        $uuid = $input->getOption('realm') . ':' . $uuid;
                     }
                 }
-                $uuid = $this->getUuidFromHostingName($uuid);
-                $commandData->input()->setArgument('uuid', $uuid);
-            }
-
-            // Convert environment parameters to an EnvironmentResponse
-            if ($commandData->input()->hasArgument('environment')) {
-                $environmentName = $commandData->input()->getArgument('environment');
-                $environment = $this->getEnvironmentFromEnvironmentName($uuid, $environmentName);
-                $commandData->input()->setArgument('environment', $environment);
-            }
-            if ($commandData->input()->hasArgument('environmentFrom')) {
-                $environmentFromName = $commandData->input()->getArgument('environmentFrom');
-                $environmentFrom = $this->getEnvironmentFromEnvironmentName($uuid, $environmentFromName);
-                $commandData->input()->setArgument('environmentFrom', $environmentFrom);
-            }
-            if ($commandData->input()->hasArgument('environmentTo')) {
-                $environmentToName = $commandData->input()->getArgument('environmentTo');
-                $environmentTo = $this->getEnvironmentFromEnvironmentName($uuid, $environmentToName);
-                $commandData->input()->setArgument('environmentTo', $environmentTo);
+                $uuid = $this->cloudapiService->getApplicationUuid($uuid);
+                $input->setArgument('uuid', $uuid);
             }
         }
     }
 
     /**
-     * @param string $uuid
-     * @param string $environment
-     * @return EnvironmentResponse
-     * @throws Exception
-     */
-    protected function getEnvironmentFromEnvironmentName($uuid, $environment)
-    {
-        $environments = $this->cloudapi->environments($uuid);
-        foreach ($environments as $e) {
-            if ($environment === $e->name) {
-                return $e;
-            }
-        }
-        throw new Exception('Unable to find ID for environment');
-    }
-
-    /**
-     * @param string $name
-     * @return mixed
-     * @throws Exception
-     */
-    protected function getUuidFromHostingName($name)
-    {
-        $applications = $this->cloudapi->applications();
-        foreach ($applications as $application) {
-            if ($name === $application->hosting->id) {
-                return $application->uuid;
-            }
-        }
-        throw new Exception('Unable to find UUID for application');
-    }
-
-    /**
+     * Waits for a notification to complete.
      *
-     * Since Acquia API v2 doesn't return the task ID when a task is created,
-     * we must instead check the task list for tasks of a particular type
-     * and ensure that they are all completed before assuming our task is done.
-     *
-     * It's a bit of a hack but there's not really another choice.
-     *
-     * @string $uuid
-     * @param  $name
-     * @return bool
-     * @throws Exception
+     * @param  OperationResponse $response
+     * @throws \Exception
      */
-    protected function waitForTask($uuid, $name)
+    protected function waitForNotification($response)
     {
         if ($this->input()->getOption('no-wait')) {
-            $this->say('Skipping wait for task.');
+            if ($this->output->isVerbose()) {
+                $this->say('Skipping wait for notification.');
+            }
             return true;
         }
 
-        $sleep = $this->extraConfig['taskwait'];
-        $timeout = $this->extraConfig['timeout'];
+        $notificationArray = explode('/', $response->links->notification->href);
+        if (empty($notificationArray)) {
+            throw new \Exception('Notification UUID not found.');
+        }
+        $notificationUuid = end($notificationArray);
 
-        // Create a date 30 seconds prior to this function being called to
-        // ensure we capture our task in the filter.
-        $buffer = 30;
+        $extraConfig = Robo::config()->get('extraconfig');
+        $sleep = $extraConfig['taskwait'];
+        $timeout = $extraConfig['timeout'];
 
-        // Acquia servers all use UTC so ensure we use the right timezone.
         $timezone = new \DateTimeZone('UTC');
-
         $start = new \DateTime(date('c'));
         $start->setTimezone($timezone);
-        $start->sub(new \DateInterval('PT' . $buffer . 'S'));
 
-        // Kindly stolen from https://jonczyk.me/2017/09/20/make-cool-progressbar-symfony-command/
-        $output = $this->output();
-        $progress = new ProgressBar($output);
-        $progress->setBarCharacter('<fg=green>⚬</>');
-        $progress->setEmptyBarCharacter('<fg=red>⚬</>');
-        $progress->setProgressCharacter('<fg=green>➤</>');
+        $progress = $this->getProgressBar();
         $progress->setFormat("<fg=white;bg=cyan> %message:-45s%</>\n%elapsed:6s% [%bar%] %percent:3s%%");
-
+        $progress->setMessage('Looking up notification');
         $progress->start();
-        $progress->setMessage('Looking up task');
+
+        $notificationAdapter = new Notifications($this->cloudapi);
 
         while (true) {
             $progress->advance($sleep);
             // Sleep initially to ensure that the task gets registered.
             sleep($sleep);
-            // Add queries to limit the tasks returned to a single task of a specific name created within the last 30s.
-            $this->cloudapi->addQuery('from', $start->format(\DateTime::ATOM));
-            $this->cloudapi->addQuery('sort', '-created');
-            $this->cloudapi->addQuery('limit', 1);
-            $this->cloudapi->addQuery('filter', "name=${name}");
 
-            $tasks = $this->cloudapi->tasks($uuid);
-            $this->cloudapi->clearQuery();
+            $notification = $notificationAdapter->get($notificationUuid);
 
-            if (!$task = reset($tasks)) {
-                throw new \Exception('No tasks registered. 
-The task may have been queried prior to being registered within the API.
-This may be due to the wait timeout being set too low in the Acquia Cli configuration file.');
-            }
-
-            $progress->setMessage('Task ' . $task->status);
-            switch ($task->status) {
+            $progress->setMessage(sprintf('Notification %s: %s', $notification->uuid, $notification->status));
+            switch ($notification->status) {
                 case self::TASKFAILED:
                     // If there's one failure we should throw an exception
-                    // although it may not be for our task.
                     throw new \Exception('Acquia task failed.');
                     break(2);
-                // If tasks are started or in progress, we should continue back
-                // to the top of the loop and wait until tasks are complete.
+                    // If tasks are started or in progress, we should continue back
+                    // to the top of the loop and wait until tasks are complete.
                 case self::TASKSTARTED:
                 case self::TASKINPROGRESS:
                     break;
@@ -236,7 +201,7 @@ This may be due to the wait timeout being set too low in the Acquia Cli configur
                     // Completed tasks should break out of the loop and continue execution.
                     break(2);
                 default:
-                    throw new \Exception('Unknown task status.');
+                    throw new \Exception('Unknown notification status.');
                     break(2);
             }
 
@@ -244,8 +209,6 @@ This may be due to the wait timeout being set too low in the Acquia Cli configur
             // Create a new DateTime for now.
             $current = new \DateTime(date('c'));
             $current->setTimezone($timezone);
-            // Remove our buffer from earlier that we took away from the original start date.
-            $current->sub(new \DateInterval('PT' . $buffer . 'S'));
             // Take our current time, remove our start time and see if it exceeds the timeout.
             if ($timeout <= ($current->getTimestamp() - $start->getTimestamp())) {
                 throw new \Exception("Task timeout of ${timeout} seconds exceeded.");
@@ -258,25 +221,42 @@ This may be due to the wait timeout being set too low in the Acquia Cli configur
     }
 
     /**
+     * Copy all DBs from one environment to another.
+     *
      * @param string              $uuid
      * @param EnvironmentResponse $environmentFrom
      * @param EnvironmentResponse $environmentTo
+     * @param null|string         $dbName The DB to move, if null move all DBs.
+     * @param boolean             $backup Whether to backup DBs first.
      */
-    protected function backupAndMoveDbs($uuid, $environmentFrom, $environmentTo)
+    protected function moveDbs($uuid, $environmentFrom, $environmentTo, $dbName = null, $backup = true)
     {
-        $environmentFromLabel = $environmentFrom->label;
-        $environmentToLabel = $environmentTo->label;
+        if (null !== $dbName) {
+            $this->cloudapi->addQuery('filter', "name=${dbName}");
+        }
 
-        $databases = $this->cloudapi->environmentDatabases($environmentFrom->uuid);
+        $dbAdapter = new Databases($this->cloudapi);
+        $databases = $dbAdapter->getAll($uuid);
+        $this->cloudapi->clearQuery();
+
         foreach ($databases as $database) {
-            $this->backupDb($uuid, $environmentTo, $database);
-            $dbName = $database->name;
+            if ($backup) {
+                $this->backupDb($uuid, $environmentTo, $database);
+            }
 
             // Copy DB from prod to non-prod.
-            $this->say("Moving DB (${dbName}) from ${environmentFromLabel} to ${environmentToLabel}");
+            $this->say(
+                sprintf(
+                    'Moving DB (%s) from %s to %s',
+                    $database->name,
+                    $environmentFrom->label,
+                    $environmentTo->label
+                )
+            );
 
-            $this->cloudapi->databaseCopy($environmentFrom->uuid, $dbName, $environmentTo->uuid);
-            $this->waitForTask($uuid, 'DatabaseCopied');
+            $databaseAdapter = new Databases($this->cloudapi);
+            $response = $databaseAdapter->copy($environmentFrom->uuid, $database->name, $environmentTo->uuid);
+            $this->waitForNotification($response);
         }
     }
 
@@ -284,9 +264,10 @@ This may be due to the wait timeout being set too low in the Acquia Cli configur
      * @param string              $uuid
      * @param EnvironmentResponse $environment
      */
-    protected function backupAllEnvironmentDbs($uuid, EnvironmentResponse $environment)
+    protected function backupAllEnvironmentDbs($uuid, $environment)
     {
-        $databases = $this->cloudapi->databases($uuid);
+        $dbAdapter = new Databases($this->cloudapi);
+        $databases = $dbAdapter->getAll($uuid);
         foreach ($databases as $database) {
             $this->backupDb($uuid, $environment, $database);
         }
@@ -297,14 +278,13 @@ This may be due to the wait timeout being set too low in the Acquia Cli configur
      * @param EnvironmentResponse $environment
      * @param DatabaseResponse    $database
      */
-    protected function backupDb($uuid, EnvironmentResponse $environment, DatabaseResponse $database)
+    protected function backupDb($uuid, $environment, $database)
     {
         // Run database backups.
-        $label = $environment->label;
-        $dbName = $database->name;
-        $this->say("Backing up DB (${dbName}) on ${label}");
-        $this->cloudapi->createDatabaseBackup($environment->uuid, $database->name);
-        $this->waitForTask($uuid, 'DatabaseBackupCreated');
+        $this->say(sprintf('Backing up DB (%s) on %s', $database->name, $environment->label));
+        $dbAdapter = new DatabaseBackups($this->cloudapi);
+        $response = $dbAdapter->create($environment->uuid, $database->name);
+        $this->waitForNotification($response);
     }
 
     /**
@@ -312,79 +292,30 @@ This may be due to the wait timeout being set too low in the Acquia Cli configur
      * @param EnvironmentResponse $environmentFrom
      * @param EnvironmentResponse $environmentTo
      */
-    protected function backupFiles($uuid, EnvironmentResponse $environmentFrom, EnvironmentResponse $environmentTo)
+    protected function copyFiles($uuid, $environmentFrom, $environmentTo)
     {
-        // Copy files from prod to non-prod.
-        $labelFrom = $environmentFrom->label;
-        $labelTo = $environmentTo->label;
-        $this->say("Moving files from ${labelFrom} to ${labelTo}");
-        $this->cloudapi->copyFiles($environmentFrom->uuid, $environmentTo->uuid);
-        $this->waitForTask($uuid, 'FilesCopied');
+        $environmentsAdapter = new Environments($this->cloudapi);
+        $this->say(sprintf('Copying files from %s to %s', $environmentFrom->label, $environmentTo->label));
+        $response = $environmentsAdapter->copyFiles($environmentFrom->uuid, $environmentTo->uuid);
+        $this->waitForNotification($response);
     }
 
-    /**
-     * @param string              $uuid
-     * @param EnvironmentResponse $environment
-     * @param string              $branch
-     * @param bool                $skipDrushTasks
-     */
-    protected function acquiaDeployEnv($uuid, EnvironmentResponse $environment, $branch, $skipDrushTasks)
+    protected function setTableStyles()
     {
-        $this->backupAllEnvironmentDbs($uuid, $environment);
-        $label = $environment->label;
-        $this->say("Deploying ${branch} to the ${label} environment");
-
-        $this->cloudapi->switchCode($environment->uuid, $branch);
-        $this->waitForTask($uuid, 'CodeSwitched');
-
-        if ($skipDrushTasks === true) {
-            $this->say('Skipping Drush tasks.');
-            return true;
-        }
-
-        $this->acquiaConfigUpdate($environment);
+        $tableStyle = new TableStyle();
+        $tableStyle->setPadType(STR_PAD_BOTH);
+        Table::setStyleDefinition('center-align', $tableStyle);
     }
 
-    /**
-     * @param EnvironmentResponse $environment
-     */
-    protected function acquiaConfigUpdate($environment)
+    protected function getProgressBar()
     {
-        $sshUrl = $environment->sshUrl;
-        $drushAlias = strtok($sshUrl, '@');
+        // Kindly stolen from https://jonczyk.me/2017/09/20/make-cool-progressbar-symfony-command/
+        $output = $this->output();
+        $progressBar = new ProgressBar($output);
+        $progressBar->setBarCharacter('<fg=green>⚬</>');
+        $progressBar->setEmptyBarCharacter('<fg=red>⚬</>');
+        $progressBar->setProgressCharacter('<fg=green>➤</>');
 
-        $syncDir = $this->extraConfig['configsyncdir'];
-
-        $this->taskDrushStack()
-            ->stopOnFail()
-            ->siteAlias("@${drushAlias}")
-            ->clearCache('drush')
-            ->drush('state-set system.maintenance_mode 1')
-            ->drush('cache-rebuild')
-            ->updateDb()
-            ->drush(['pm-enable', 'config_split'])
-            ->drush(['config-import', $syncDir])
-            ->drush('cache-rebuild')
-            ->drush('state-set system.maintenance_mode 0')
-            ->run();
-    }
-
-    /**
-     * @param string              $uuid
-     * @param EnvironmentResponse $environment
-     */
-    protected function acquiaPurgeVarnishForEnvironment($uuid, EnvironmentResponse $environment)
-    {
-        $domains = $this->cloudapi->domains($environment->uuid);
-
-        $domainsList = array_map(function ($domain) {
-            $hostname = $domain->hostname;
-            $this->say("Purging varnish cache for ${hostname}");
-
-            return $hostname;
-        }, $domains->getArrayCopy());
-
-        $this->cloudapi->purgeVarnishCache($environment->uuid, $domainsList);
-        $this->waitForTask($uuid, 'VarnishCleared');
+        return $progressBar;
     }
 }

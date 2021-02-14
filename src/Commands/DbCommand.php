@@ -2,108 +2,175 @@
 
 namespace AcquiaCli\Commands;
 
-use AcquiaCloudApi\CloudApi\Connector;
+use AcquiaCloudApi\Connector\Connector;
 use AcquiaCloudApi\Response\EnvironmentResponse;
+use AcquiaCloudApi\Endpoints\Databases;
+use AcquiaCloudApi\Endpoints\DatabaseBackups;
 use Symfony\Component\Console\Helper\Table;
+use Symfony\Component\Console\Helper\TableSeparator;
+use Symfony\Component\Console\Helper\TableCell;
+use Symfony\Component\Console\Output\BufferedOutput;
 
 /**
- * Class DomainCommand
+ * Class DbCommand
+ *
  * @package AcquiaCli\Commands
  */
 class DbCommand extends AcquiaCommand
 {
-    /**
-     * Copies all DBs from one environment to another environment.
-     *
-     * @param string              $uuid
-     * @param EnvironmentResponse $environmentFrom
-     * @param EnvironmentResponse $environmentTo
-     *
-     * @command db:copy:all
-     */
-    public function acquiaCopyDb($uuid, EnvironmentResponse $environmentFrom, EnvironmentResponse $environmentTo)
-    {
-        $this->backupAndMoveDbs($uuid, $environmentFrom, $environmentTo);
-    }
 
     /**
-     * Backs up all DBs in an environment.
+     * Shows all databases.
      *
-     * @param string              $uuid
-     * @param EnvironmentResponse $environment
+     * @param string $uuid
      *
-     * @command db:backup
+     * @command database:list
+     * @aliases db:list
      */
-    public function acquiaBackupDb($uuid, $environment)
+    public function dbList(Databases $databaseAdapter, $uuid)
     {
-        $this->backupAllEnvironmentDbs($uuid, $environment);
-    }
-
-    /**
-     * Shows a list of database backups for all databases in an environment.
-     *
-     * @param string              $uuid
-     * @param EnvironmentResponse $environment
-     *
-     * @command db:backup:list
-     */
-    public function acquiaDbBackupList($uuid, $environment)
-    {
-
-        $databases = $this->cloudapi->environmentDatabases($environment->uuid);
-
+        $databases = $databaseAdapter->getAll($uuid);
         $table = new Table($this->output());
-        $table->setHeaders(['ID', 'Type', 'Timestamp']);
-
+        $table->setHeaders(['Databases']);
         foreach ($databases as $database) {
-            $dbName = $database->name;
-            $this->yell($dbName);
-            $backups = $this->cloudapi->databaseBackups($environment->uuid, $dbName);
-            foreach ($backups as $backup) {
-                $table
-                    ->addRows([
-                        [
-                            $backup->id,
-                            ucfirst($backup->type),
-                            $backup->completedAt,
-                        ],
-                    ]);
-            }
+            $table
+                ->addRows(
+                    [
+                    [
+                        $database->name,
+                    ]
+                    ]
+                );
         }
         $table->render();
     }
 
     /**
-     * Restores a database from a saved backup.
+     * Creates a database.
      *
-     * @param string              $uuid
-     * @param EnvironmentResponse $environment
-     * @param string              $backupId
+     * @param string $uuid
+     * @param string $dbName
      *
-     * @command db:backup:restore
+     * @command database:create
+     * @aliases database:add,db:create,db:add
      */
-    public function acquiaDbBackupRestore($uuid, $environment, $backupId)
+    public function dbCreate(Databases $databaseAdapter, $uuid, $dbName)
     {
-        $environmentName = $environment->label;
-        if ($this->confirm("Are you sure you want to restore backup id ${backupId} to ${environmentName}?")) {
-            $this->cloudapi->restoreDatabaseBackup($environment->uuid, $backupId);
-            $this->waitForTask($uuid, 'DatabaseBackupRestored');
+        $response = $databaseAdapter->create($uuid, $dbName);
+        $this->say(sprintf('Creating database (%s)', $dbName));
+        $this->waitForNotification($response);
+    }
+
+    /**
+     * Deletes a database.
+     *
+     * @param string $uuid
+     * @param string $dbName
+     *
+     * @command database:delete
+     * @aliases database:remove,db:remove,db:delete
+     */
+    public function dbDelete(Databases $databaseAdapter, $uuid, $dbName)
+    {
+        if ($this->confirm('Are you sure you want to delete this database?')) {
+            $this->say(sprintf('Deleting database (%s)', $dbName));
+            $response = $databaseAdapter->delete($uuid, $dbName);
+            $this->waitForNotification($response);
         }
     }
 
     /**
-     * Provides a database backup link.
+     * Truncates a database (only applicable to Acquia free tier).
      *
-     * @param string              $uuid
-     * @param EnvironmentResponse $environment
-     * @param int                 $backupId
+     * @param string $uuid
+     * @param string $dbName
      *
-     * @command db:backup:link
+     * @command database:truncate
+     * @aliases db:truncate
      */
-    public function acquiaDbBackupLink($uuid, $environment, $backupId)
+    public function dbTruncate(Databases $databaseAdapter, $uuid, $dbName)
     {
-        $environmentUuid = $environment->uuid;
-        $this->say(Connector::BASE_URI .
-            "/environments/${environmentUuid}/database-backups/${backupId}/actions/download");
+        if ($this->confirm('Are you sure you want to truncate this database?')) {
+            $this->say(sprintf('Truncate database (%s)', $dbName));
+            $response = $databaseAdapter->truncate($uuid, $dbName);
+            $this->waitForNotification($response);
+        }
+    }
+
+    /**
+     * Copies a database from one environment to another.
+     *
+     * @param string $uuid
+     * @param string $environmentFrom
+     * @param string $environmentTo
+     * @param string $dbName
+     *
+     * @command database:copy
+     * @option no-backup Do not backup the databases on production.
+     * @aliases db:copy
+     */
+    public function dbCopy(
+        $uuid,
+        $environmentFrom,
+        $environmentTo,
+        $dbName,
+        $options = ['no-backup']
+    ) {
+        $environmentFrom = $this->cloudapiService->getEnvironment($uuid, $environmentFrom);
+        $environmentTo = $this->cloudapiService->getEnvironment($uuid, $environmentTo);
+
+        if (
+            $this->confirm(
+                sprintf(
+                    'Are you sure you want to copy database %s from %s to %s?',
+                    $dbName,
+                    $environmentFrom->label,
+                    $environmentTo->label
+                )
+            )
+        ) {
+            if (!$options['no-backup']) {
+                $this->moveDbs($uuid, $environmentFrom, $environmentTo, $dbName);
+            } else {
+                $this->moveDbs($uuid, $environmentFrom, $environmentTo, $dbName, false);
+            }
+        }
+    }
+
+    /**
+     * Copies all DBs from one environment to another environment.
+     *
+     * @param string $uuid
+     * @param string $environmentFrom
+     * @param string $environmentTo
+     *
+     * @command database:copy:all
+     * @option no-backup Do not backup the databases on production.
+     * @aliases db:copy:all
+     */
+    public function dbCopyAll(
+        $uuid,
+        $environmentFrom,
+        $environmentTo,
+        $options = ['no-backup']
+    ) {
+        $environmentFrom = $this->cloudapiService->getEnvironment($uuid, $environmentFrom);
+        $environmentTo = $this->cloudapiService->getEnvironment($uuid, $environmentTo);
+
+        if (
+            $this->confirm(
+                sprintf(
+                    'Are you sure you want to copy all databases from %s to %s?',
+                    $environmentFrom->label,
+                    $environmentTo->label
+                )
+            )
+        ) {
+            if (!$options['no-backup']) {
+                $this->moveDbs($uuid, $environmentFrom, $environmentTo);
+            } else {
+                $this->moveDbs($uuid, $environmentFrom, $environmentTo, null, false);
+            }
+        }
     }
 }
